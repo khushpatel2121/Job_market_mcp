@@ -13,9 +13,17 @@ import asyncio
 import json
 import os
 import sys
+import uuid
 from groq import Groq
 from fastmcp import Client
 from dotenv import load_dotenv
+
+from memory_manager import (
+    init_memory_db,
+    log_message,
+    get_last_session_summary,
+    search_episodic,
+)
 
 load_dotenv()
 
@@ -71,6 +79,16 @@ async def run_agent():
     print(f"{DIM}  Type 'quit' or 'exit' to stop{RESET}\n")
     print(f"{DIM}  Connecting to MCP server...{RESET}")
 
+    # ── Memory Setup ───────────────────────────────────────────
+    # session_id identifies THIS run — used to separate "current
+    # conversation" from "past conversations" when querying memory.db
+    init_memory_db()
+    session_id = str(uuid.uuid4())
+
+    long_term_summary = get_last_session_summary(session_id)
+    if long_term_summary:
+        print(f"{DIM}  ✓ Loaded long-term memory from previous session{RESET}")
+
     async with Client("server.py") as mcp_client:
 
         # ── Tool Discovery ────────────────────────────────────
@@ -119,6 +137,15 @@ When showing salaries, always format with $ and commas."""
             }
         ]
 
+        # If we have a long-term memory summary from a past session,
+        # append it as a second system message so the model has
+        # continuity without polluting the core instructions above.
+        if long_term_summary:
+            messages.append({
+                "role":    "system",
+                "content": long_term_summary
+            })
+
         # ══════════════════════════════════════════════════════
         # OUTER LOOP — conversation loop
         # Runs forever, one iteration = one user question
@@ -150,6 +177,28 @@ When showing salaries, always format with $ and commas."""
                 "role":    "user",
                 "content": user_input
             })
+
+            # ── Long-term logging ──────────────────────────────
+            # Persist this message so future sessions can recall it.
+            log_message(session_id, "user", user_input)
+
+            # ── Episodic memory lookup ─────────────────────────
+            # Check past sessions for similar past questions.
+            # If found, inject as a one-off context note for THIS
+            # turn only (not saved permanently into `messages`,
+            # so it doesn't bloat every future turn's context).
+            episodic_matches = search_episodic(user_input, session_id)
+            if episodic_matches:
+                episodic_note = "Relevant past interaction(s):\n" + "\n".join(
+                    f"- Previously asked: \"{m['past_question']}\" "
+                    f"→ answered: \"{m['past_answer']}\""
+                    for m in episodic_matches if m["past_answer"]
+                )
+                messages.append({
+                    "role":    "system",
+                    "content": episodic_note
+                })
+                print(f"{DIM}  ✓ Found {len(episodic_matches)} related past interaction(s){RESET}")
 
             print(f"{DIM}  Thinking...{RESET}")
 
@@ -208,6 +257,10 @@ When showing salaries, always format with $ and commas."""
                     final_answer = assistant_message.content or ""
                     print(f"\n{BOLD}{GREEN}  Agent:{RESET} {final_answer}\n")
                     sys.stdout.flush()
+
+                    # Long-term logging — persist the assistant's answer
+                    log_message(session_id, "assistant", final_answer)
+
                     break  # ← breaks INNER loop only, NOT outer loop
 
                 # ── Execute Tool Calls ────────────────────────
